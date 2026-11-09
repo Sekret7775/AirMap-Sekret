@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Карта повітряної обстановки</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html,body{height:100%;margin:0;font:15px/1.4 -apple-system,system-ui,sans-serif}
+body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0)}
+#map{flex:1;min-height:0}
+#bar{padding:8px;background:#fff;color:#111;display:flex;gap:6px;flex-wrap:wrap;padding-bottom:max(8px,env(safe-area-inset-bottom,0))}
+#bar input{flex:1;min-width:140px;padding:9px;border:1px solid #bbb;border-radius:9px;font:inherit}
+#bar button{padding:9px 12px;border:0;border-radius:9px;background:#2563eb;color:#fff;font:inherit}
+#bar button.g{background:#e5e7eb;color:#111}
+#log{width:100%;max-height:22vh;overflow:auto;font-size:13px}
+#log div{padding:3px 0;border-top:1px solid #eee}
+#log small{color:#666;display:block}
+.pin{width:14px;height:14px;border-radius:50%;background:#d92d20;border:2px solid #fff;box-shadow:0 0 0 0 rgba(217,45,32,.6);animation:p 1.6s infinite}
+@keyframes p{70%{box-shadow:0 0 0 14px rgba(217,45,32,0)}100%{box-shadow:0 0 0 0 rgba(217,45,32,0)}}
+.dst{width:12px;height:12px;border-radius:50%;background:#2563eb;border:2px solid #fff}
+.ah{color:#2563eb;font-size:18px;line-height:18px;text-align:center}
+.lbl{background:#fff;color:#111;border:0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="bar">
+<button id="nx">Далі ▶</button><button id="all" class="g">Усі</button><button id="rs" class="g">Скинути</button>
+<input id="in" placeholder="Напр.: 2 на Переяслав з Чернігівщини"><button id="add">Додати</button>
+<div id="log"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+var map=L.map('map').setView([50.3,30.8],8);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:17,attribution:'© OpenStreetMap'}).addTo(map);
+var layer=L.layerGroup().addTo(map);
+
+// Демо-повідомлення зі скріншотів: [час, текст, номер повідомлення, на яке це відповідь]
+var SEED=[["22:00","Реактив на Рокитне",null],["22:02","Рокитне ⚠️",0],["22:07","Узин",null],["22:09","На Васік з півдня",null],["22:11","Гребінки",null],["22:15","На Узин йде",4],["22:25","1 біля Узина кружляє, 200",null],["22:25","1 на Веремʼя, 4500",null],["22:25","Другий зник",7],["22:27","Першого нема",6],["22:27","Одне на Згурівку з Чернігівщини йде",null],["22:32","4 повз Славутич в зону, йдуть 1 за 1",null],["22:42","Далі на Житомирщину",11]];
+var ALIAS={'васік':'Васильків','васіка':'Васильків','васільків':'Васильків'};
+var STOP='на з із біля повз над далі одне один другий першого реактив реактивний група аеродром зону зона'.split(' ');
+var msgs=[],shown=0,run=0;
+
+// --- Геокодування через Nominatim (назви українською), з кешем і чергою 1 запит/сек
+var cache={};try{cache=JSON.parse(localStorage.getItem('geo')||'{}')}catch(e){}
+var chain=Promise.resolve();
+function save(){try{localStorage.setItem('geo',JSON.stringify(cache))}catch(e){}}
+function ask(q){return new Promise(function(res){
+  if(q in cache)return res(cache[q]);
+  chain=chain.then(function(){return new Promise(function(done){setTimeout(function(){
+    fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=uk&limit=5&countrycodes=ua&viewbox=27,52.6,35,48.5&q='+encodeURIComponent(q))
+    .then(function(r){return r.json()}).then(function(a){
+      var b=a.filter(function(x){return x.category==='place'||x.category==='boundary'})[0]||a[0];
+      var v=b?{name:(b.name||b.display_name.split(',')[0]),lat:+b.lat,lon:+b.lon}:null;
+      cache[q]=v;save();res(v);done()}).catch(function(){res(null);done()})},1100)})});
+})}
+function forms(w){
+  var l=w.toLowerCase();if(ALIAS[l])return [ALIAS[l]];
+  w=w.charAt(0).toUpperCase()+w.slice(1);
+  if(/щин[а-яіїє]*$/i.test(w))return [w.replace(/щин[а-яіїє]*$/i,'ська область')];
+  var s=w.replace(/(ою|ею|ом|ами|ах|ів|ям|ам|у|ю|а|я|и|і|е|є|ї)$/,'');
+  return [w,s,s+'а',s+'я',s+'ь',s+'и',s+'і'].filter(function(x,i,a){return x&&a.indexOf(x)===i});
+}
+async function geo(w){var f=forms(w);for(var i=0;i<f.length;i++){var r=await ask(f[i]);if(r)return r}return null}
+
+// --- Розбір повідомлення
+async function parse(m,tr){
+  var s=m.s,t={pos:null,tgt:null,org:null,off:null,cnt:'',dead:false},words=[],rest=s;
+  var re=/(^|\s)(на|з|із|біля|повз|над)\s+([^\s,.;!?⚠️]+)/gi,x;
+  while((x=re.exec(s))){var p=x[2].toLowerCase();
+    if(p==='з'&&/^(півдня|півночі|заходу|сходу)$/i.test(x[3])){t.off={'півдня':[-1,0],'півночі':[1,0],'заходу':[0,-1],'сходу':[0,1]}[x[3].toLowerCase()];continue}
+    words.push([x[3],p==='на'?'tgt':(p==='з'||p==='із')?'org':'pos'])}
+  rest=s.replace(re,' ');
+  (rest.match(/[А-ЯІЇЄҐ][а-яіїєґʼ'’-]{2,}/g)||[]).forEach(function(w){if(STOP.indexOf(w.toLowerCase())<0)words.push([w,'pos'])});
+  var c=/^\s*(\+?\d+)/.exec(s);t.cnt=c?c[1]:(/^(одне|один)/i.test(s)?'1':'');
+  var rt=m.r!=null?tr[m.r]:null;
+  if(m.r!=null&&/зник|нема|збит/i.test(s)){if(rt)rt.dead=true;m.res=rt?'Ціль прибрано':'Нема до чого прив’язати';return null}
+  for(var i=0;i<words.length;i++){var k=words[i][1];if(t[k])continue;var g=await geo(words[i][0]);if(g)t[k]=g}
+  if(!t.pos&&!t.org&&rt&&rt.pos)t.pos=rt.pos;
+  if(!t.pos&&!t.tgt&&!t.org){m.res='Місце не розпізнано';return null}
+  m.res=(t.pos?t.pos.name:'')+(t.org?' (з '+t.org.name+')':'')+(t.tgt?' → '+t.tgt.name:'');
+  return t;
+}
+
+// --- Малювання
+function ll(g){return [g.lat,g.lon]}
+function draw(tr){
+  layer.clearLayers();
+  tr.forEach(function(t){
+    if(!t||t.dead)return;
+    var T=t.tgt,S=t.pos||t.org;
+    if(!S&&T&&t.off)S={lat:T.lat+t.off[0]*.15,lon:T.lon+t.off[1]*.2};
+    if(T&&S&&(S.lat!==T.lat||S.lon!==T.lon)){
+      L.polyline([ll(S),ll(T)],{color:'#2563eb',weight:3,dashArray:'6 6'}).addTo(layer);
+      var ang=Math.atan2((T.lat-S.lat),(T.lon-S.lon)*Math.cos(T.lat*Math.PI/180))*180/Math.PI;
+      L.marker(ll(T),{icon:L.divIcon({className:'ah',html:'<div style="transform:rotate('+(-ang)+'deg)">▶</div>',iconSize:[18,18]}),interactive:false}).addTo(layer)}
+    if(T&&!t.pos)L.marker(ll(T),{icon:L.divIcon({className:'',html:'<div class="dst"></div>',iconSize:[12,12]})}).addTo(layer).bindTooltip((t.cnt?t.cnt+' · ':'')+T.name,{permanent:true,direction:'right',className:'lbl'});
+    if(t.pos)L.marker(ll(t.pos),{icon:L.divIcon({className:'',html:'<div class="pin"></div>',iconSize:[14,14]})}).addTo(layer).bindTooltip((t.cnt?t.cnt+' · ':'')+t.pos.name,{permanent:true,direction:'right',className:'lbl'});
+  });
+}
+async function render(){
+  var my=++run,tr=[];
+  for(var i=0;i<shown;i++){msgs[i].res='…';if(my!==run)return;tr[i]=await parse(msgs[i],tr);if(my!==run)return;
+    draw(tr);log()}
+  draw(tr);log();
+  var pts=[];tr.forEach(function(t){if(t&&!t.dead)[t.pos,t.tgt].forEach(function(g){if(g)pts.push(ll(g))})});
+  if(pts.length)map.fitBounds(pts,{padding:[40,40],maxZoom:11});
+}
+function log(){document.getElementById('log').innerHTML=msgs.slice(0,shown).map(function(m){return '<div><b>'+m.t+'</b> '+m.s.replace(/</g,'&lt;')+'<small>'+(m.res||'')+'</small></div>'}).reverse().join('')}
+function reset(){msgs=SEED.map(function(a){return {t:a[0],s:a[1],r:a[2]}});shown=0;layer.clearLayers();log();run++}
+document.getElementById('nx').onclick=function(){if(shown<msgs.length){shown++;render()}};
+document.getElementById('all').onclick=function(){shown=msgs.length;render()};
+document.getElementById('rs').onclick=reset;
+document.getElementById('add').onclick=function(){var i=document.getElementById('in');if(!i.value.trim())return;
+  msgs.splice(shown,0,{t:'зараз',s:i.value,r:null});
+  msgs.forEach(function(m,k){if(k>shown&&m.r!=null&&m.r>=shown)m.r++});
+  shown++;i.value='';render()};
+reset();
+</script>
+</body>
+</html>
